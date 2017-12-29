@@ -4,14 +4,16 @@ extern crate structopt;
 extern crate structopt_derive;
 #[macro_use] extern crate log;
 extern crate env_logger;
+#[macro_use]
 extern crate tantivy;
 extern crate whatlang;
 extern crate serde_json;
 extern crate chan;
 extern crate itertools;
-extern crate warc_parser;
 extern crate libflate;
-extern crate nom;
+
+mod warc_reader;
+use self::warc_reader::WARCReader;
 
 use std::collections::BTreeMap;
 use libflate::gzip::Decoder;
@@ -20,13 +22,11 @@ use std::thread;
 use std::path::{Path, PathBuf};
 use std::str;
 use structopt::StructOpt;
-use std::mem;
 use std::fs::{self, File};
 use tantivy::IndexWriter;
 use tantivy::schema::{Schema, SchemaBuilder, TEXT, STORED};
 use std::io::{Read, BufRead, BufReader};
 use itertools::Itertools;
-use nom::IResult;
 
 const WET_FILE: &'static str = "wet.txt";
 
@@ -96,7 +96,7 @@ impl WetFiles {
 
     fn skip_to(&mut self, checkpoint: &str) {
         let pos = self.files.iter().position(|s| s == checkpoint).expect(&format!("Failed to find checkpoint {:?}", checkpoint));
-        self.files = self.files[pos..].to_owned();
+        self.files = self.files[pos+1..].to_owned();
     }
 
     fn files(&self) -> &[String] {
@@ -121,7 +121,7 @@ fn init(index_directory: &Path, wet_files: &Path) {
     fs::copy(wet_files, &dest_wet_file).expect("Failed to copy url file");
 }
 
-const CHUNK_SIZE: usize = 10;
+const CHUNK_SIZE: usize = 1;
 
 struct WetData {
     pub wet_file: String,
@@ -183,98 +183,55 @@ fn download_wet(url_root: String, wet_files: WetFiles) -> chan::Receiver<WetData
     recv
 }
 
-
-
-
-
-struct WARCReader<R: Read> {
-    header: BTreeMap<String, String>,
-    buffer: Vec<u8>,
-    reader: BufReader<R>
-}
-
-impl<R: Read> WARCReader<R> {
-
-    fn new(r: R) -> WARCReader<R> {
-        WARCReader {
-            header: BTreeMap::new(),
-            buffer: Vec::new(),
-            reader: BufReader::new(r),
+fn is_english(text: &str) -> bool {
+    let detector = whatlang::Detector::new();
+    let (start, stop) = {
+        // detecting language is actually quite expensive. We only take 1000 byte in the middle.
+        // because it is utf8 we need some logic to avoid cutting in the middle of a codepoint.
+        if text.len() > 1008 {
+            let target_start = (text.len() - 1000) / 2;
+            let utf8_start = |target: usize| {
+                (0..4)
+                    .map(|i| target-i)
+                    .filter(|i| { text.as_bytes()[*i] & 0b1100_0000 != 0b1000_0000 })
+                    .next()
+            };
+            let start = utf8_start(target_start).unwrap_or(0);
+            let stop = utf8_start(target_start + 1000).unwrap_or(text.len());
+            (start, stop)
+        } else {
+            (0, text.len())
         }
-    }
-
-    fn url(&self) -> Option<&String> {
-        self.header.get("WARC-Target-URI")
-    }
-
-    fn content(&self) -> &str {
-        str::from_utf8(&self.buffer).expect("Content is not utf8")
-    }
-
-    fn read(&mut self) -> bool {
-        self.header.clear();
-        let mut line = String::new();
-        while self.reader.read_line(&mut line).expect("io error") > 0 {
-            if !line.trim().is_empty() {
-                break;
-            }
-            line.clear();
-        }
-        if line.trim() != "WARC/1.0" {
-            return false;
-        }
-        line.clear();
-        let mut url: Option<String> = None;
-        let mut content_len = 0;
-        while self.reader.read_line(&mut line).expect("io error") > 0 {
-            {
-                let fields = line.trim().splitn(2, ":").collect::<Vec<&str>>();
-                if fields.len() == 2 {
-                    self.header.insert(fields[0].to_string(), fields[1].trim().to_string());
-                } else {
-                    break;
-                }
-            }
-            line.clear();
-        }
-        let content_len_str = self.header.get("Content-Length").expect("Content length not found");
-        let content_len: usize = content_len_str.parse().expect("Failed to parse content len");
-        self.buffer.resize(content_len, 0u8);
-        self.reader.read_exact(&mut self.buffer[..]).expect("Failed to read content");
-        return true;
+    };
+    if let Some(whatlang::Lang::Eng) = detector.detect_lang(&text[start..stop]) {
+        true
+    } else {
+        false
     }
 }
 
-//    if buf_reader.read_line(&mut line).expect("io error") {
-//        while let Some(line) = buf_reader.read_line(&mut line).expect("failed to read line") {
-//            let fields = line.split(":");ARC/1.0
-////            let pos = line.position(|b| b==":");
-////            if line.is_empty() {
-////
-////            }
-//            line.clear();
-//        }
-//        Some(WARCHeader {
-//            url: String::from(""),
-//            content_len: 0
-//        })
-//    } else {
-//        None
-//    }
-
-
-fn is_english(content: &str) -> bool {
-
-}
-
-const BUFFER_LEN: usize = 10_000_000;
-fn index_wet_file(wet_data: &WetData, index_writer: &mut IndexWriter) {
+fn index_wet_file(wet_data: &WetData, schema: &Schema, index_writer: &mut IndexWriter) {
+    info!("INDEXING {}. {} bytes Gzipped", wet_data.wet_file, wet_data.data().len());
     let mut cursor: &[u8] = wet_data.data();
-    let mut decoder = Decoder::new(&mut cursor).expect("Opening gunzip for decompression");
+    let decoder = Decoder::new(&mut cursor).expect("Opening gunzip for decompression");
     let mut warc_reader = WARCReader::new(decoder);
+    let url_field = schema.get_field("url").expect("url field not in schema");
+    let text_field = schema.get_field("text").expect("text field not in schema");
     while warc_reader.read() {
         if let Some(url) = warc_reader.url() {
-
+            let content = warc_reader.content();
+            if !is_english(content) {
+                // we only index english content.
+                println!("add doc not en");
+                continue;
+            } else {
+                println!("add doc en");
+            }
+            println!("add document {}", url);
+            index_writer.add_document(doc!(
+                url_field => url.clone(),
+                text_field => warc_reader.content().to_string()
+            ));
         }
     }
 }
@@ -283,6 +240,7 @@ fn resume_download(index_directory: &Path, url_root: &str) {
     let wet_files_file = index_directory.join(WET_FILE);
     let mut wet_files = WetFiles::load(&wet_files_file).expect("Failed to load url list file");
     let index = tantivy::Index::open(index_directory).expect("Failed to open the index");
+    let schema = index.schema();
     let index_metas = index.load_metas().expect("metas");
     if let Some(checkpoint) = index_metas.payload {
         let status = Status::from(checkpoint);
@@ -303,15 +261,15 @@ fn resume_download(index_directory: &Path, url_root: &str) {
     for wet_files in wet_queue.into_iter().chunks(CHUNK_SIZE).into_iter() {
         let mut checkpoint = String::new();
         for wet_data in wet_files {
-            info!("{}", wet_data.wet_file);
-            index_wet_file(&wet_data, &mut index_writer);
+            index_wet_file(&wet_data, &schema, &mut index_writer);
             checkpoint = wet_data.wet_file.clone();
         }
+        info!("PREPARE COMMIT: {}", checkpoint);
         let mut prepared_commit = index_writer.prepare_commit().expect("Failed to prepare commit");
         prepared_commit.set_payload(&checkpoint);
-        info!("COMMIT {}", checkpoint);
+        prepared_commit.commit().expect("Commit failed");
+        info!("COMMITTED: {}", checkpoint);
     }
-//    println!("wet_files {:?}", wet_files);
 }
 
 fn main() {
@@ -333,14 +291,29 @@ fn main() {
 mod tests {
 
     use super::*;
+    use std::fs::File;
+    use libflate::gzip::Decoder;
 
-    const WARC_HEADER: &'static [u8] = include_bytes!("test.txt");
+    const WARC_HEADER: &'static [u8] = include_bytes!("test.wet");
 
     #[test]
     fn test_parse_warc() {
-        let mut warc_reader = WARCReader::new(WARC_HEADER);
+        let file = File::open("test.wet.gz").unwrap();
+
+//        let mut cursor: &[u8] = ;
+        let mut decoder = Decoder::new(file).expect("Opening gunzip for decompression");
+//        let mut buffer = vec![0u8; 10];
+//        decoder.read_exact(&mut buffer);
+//        println!("{}", str::from_utf8(&buffer).unwrap());
+//        decoder.read_exact(&mut buffer);
+//        println!("{}", str::from_utf8(&buffer).unwrap());
+//        decoder.read_exact(&mut buffer);
+//        println!("{}", str::from_utf8(&buffer).unwrap());
+//        decoder.read_exact(&mut buffer);
+//        println!("{}", str::from_utf8(&buffer).unwrap());
+        let mut warc_reader = WARCReader::new(decoder);
         while warc_reader.read() {
-            println!("url {:?}", warc_reader.url());
+            println!("url {:?} {}", warc_reader.url(), warc_reader.content().len());
         }
 
 //        let mut v = [0u8; 263];
