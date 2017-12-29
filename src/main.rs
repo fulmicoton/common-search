@@ -13,6 +13,7 @@ extern crate warc_parser;
 extern crate libflate;
 extern crate nom;
 
+use std::collections::BTreeMap;
 use libflate::gzip::Decoder;
 use curl::easy;
 use std::thread;
@@ -183,27 +184,86 @@ fn download_wet(url_root: String, wet_files: WetFiles) -> chan::Receiver<WetData
 }
 
 
-struct WARCHeader {
-    url: String,
-    content_len: usize,
+
+
+
+struct WARCReader<R: Read> {
+    header: BTreeMap<String, String>,
+    buffer: Vec<u8>,
+    reader: BufReader<R>
 }
 
-fn read_warc_header(url: &str, buf_reader: &mut BufRead) -> Option<WARCHeader> {
-    if let Some(line) = buf_reader.read_line().expect("io error") {
-        assert_eq!("WARC/1.0", line);
-        while let Some(line) = buf_reader.read_line().expect("failed to read line") {
-            line.split(":");
-            let pos = line.position(|b| b==":");
+impl<R: Read> WARCReader<R> {
 
+    fn new(r: R) -> WARCReader<R> {
+        WARCReader {
+            header: BTreeMap::new(),
+            buffer: Vec::new(),
+            reader: BufReader::new(r),
         }
-        Some(WARCHeader {
-            url: url,
-
-        })
-    } else {
-        None
     }
 
+    fn url(&self) -> Option<&String> {
+        self.header.get("WARC-Target-URI")
+    }
+
+    fn content(&self) -> &str {
+        str::from_utf8(&self.buffer).expect("Content is not utf8")
+    }
+
+    fn read(&mut self) -> bool {
+        self.header.clear();
+        let mut line = String::new();
+        while self.reader.read_line(&mut line).expect("io error") > 0 {
+            if !line.trim().is_empty() {
+                break;
+            }
+            line.clear();
+        }
+        if line.trim() != "WARC/1.0" {
+            return false;
+        }
+        line.clear();
+        let mut url: Option<String> = None;
+        let mut content_len = 0;
+        while self.reader.read_line(&mut line).expect("io error") > 0 {
+            {
+                let fields = line.trim().splitn(2, ":").collect::<Vec<&str>>();
+                if fields.len() == 2 {
+                    self.header.insert(fields[0].to_string(), fields[1].trim().to_string());
+                } else {
+                    break;
+                }
+            }
+            line.clear();
+        }
+        let content_len_str = self.header.get("Content-Length").expect("Content length not found");
+        let content_len: usize = content_len_str.parse().expect("Failed to parse content len");
+        self.buffer.resize(content_len, 0u8);
+        self.reader.read_exact(&mut self.buffer[..]).expect("Failed to read content");
+        return true;
+    }
+}
+
+//    if buf_reader.read_line(&mut line).expect("io error") {
+//        while let Some(line) = buf_reader.read_line(&mut line).expect("failed to read line") {
+//            let fields = line.split(":");ARC/1.0
+////            let pos = line.position(|b| b==":");
+////            if line.is_empty() {
+////
+////            }
+//            line.clear();
+//        }
+//        Some(WARCHeader {
+//            url: String::from(""),
+//            content_len: 0
+//        })
+//    } else {
+//        None
+//    }
+
+
+fn is_english(content: &str) -> bool {
 
 }
 
@@ -211,54 +271,12 @@ const BUFFER_LEN: usize = 10_000_000;
 fn index_wet_file(wet_data: &WetData, index_writer: &mut IndexWriter) {
     let mut cursor: &[u8] = wet_data.data();
     let mut decoder = Decoder::new(&mut cursor).expect("Opening gunzip for decompression");
-    let mut warc_reader = BufReader::new(decoder);
+    let mut warc_reader = WARCReader::new(decoder);
+    while warc_reader.read() {
+        if let Some(url) = warc_reader.url() {
 
-    if let Some(line) = warc_reader.read_line().expect("failed to read line") {
-
+        }
     }
-    /*
-    let mut buffer: Vec<u8> = vec![0u8; BUFFER_LEN];
-    let mut total_len = 0;
-    let mut terminated = false;
-
-    loop {
-        if !terminated {
-            while total_len < BUFFER_LEN {
-                let len = decoder.read(&mut buffer[total_len..]).unwrap();
-                if len == 0 {
-                    terminated = false;
-                    break;
-                }
-                total_len += len;
-            }
-        }
-
-        if total_len == 0 {
-            break;
-        }
-
-        let mut new_buffer = vec![0u8; BUFFER_LEN];
-        {
-            match warc_parser::record(&buffer[..total_len]) {
-                IResult::Done(remaining, warc_record) => {
-                    total_len = remaining.len();
-                    new_buffer[..total_len].copy_from_slice(remaining);
-                    println!("{:?}", warc_record.headers);
-                },
-                IResult::Error(err) => {
-                    panic!("Failed to parse WARC");
-                },
-                IResult::Incomplete(needed) => {
-                    panic!("Buffer too small");
-                },
-            }
-        }
-        mem::swap(&mut new_buffer, &mut buffer);
-        println!("buffer {}", total_len);
-        println!("bufferstart: {}", str::from_utf8(&buffer[..100]).expect("not utf8"));
-        */
-    }
-
 }
 
 fn resume_download(index_directory: &Path, url_root: &str) {
@@ -311,3 +329,28 @@ fn main() {
         }
     }
 }
+
+mod tests {
+
+    use super::*;
+
+    const WARC_HEADER: &'static [u8] = include_bytes!("test.txt");
+
+    #[test]
+    fn test_parse_warc() {
+        let mut warc_reader = WARCReader::new(WARC_HEADER);
+        while warc_reader.read() {
+            println!("url {:?}", warc_reader.url());
+        }
+
+//        let mut v = [0u8; 263];
+//        buf.read_exact(&mut v);
+//        println!("-");
+//        println!("{}", str::from_utf8(&v).unwrap());
+//        println!("-");
+//        assert!(parse_warc_header(&mut buf).is_none());
+    }
+
+
+}
+
