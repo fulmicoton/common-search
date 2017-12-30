@@ -1,13 +1,36 @@
 use std::collections::BTreeMap;
-use libflate::gzip::Decoder;
 use std::str;
-use std::fs::{self, File};
 use std::io::{Read, BufRead, BufReader};
+
+pub struct WARC {
+    pub url: String,
+    pub text: String
+}
+
 
 pub struct WARCReader<R: Read> {
     header: BTreeMap<String, String>,
     buffer: Vec<u8>,
     reader: BufReader<R>
+}
+
+impl<R: Read> Iterator for WARCReader<R> {
+    type Item = WARC;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if !self.read() {
+                break;
+            }
+            if let Some(url) = self.url() {
+                return Some(WARC {
+                    url: url.clone(),
+                    text: self.content().to_string()
+                })
+            }
+        }
+        None
+    }
 }
 
 impl<R: Read> WARCReader<R> {
@@ -29,19 +52,15 @@ impl<R: Read> WARCReader<R> {
     }
 
     pub fn read(&mut self) -> bool {
-        println!("read");
         self.header.clear();
         let mut line = String::new();
         while self.reader.read_line(&mut line).expect("io error") > 0 {
-            println!("line |{}|", line);
             if !line.trim().is_empty() {
-                println!("not empty");
                 break;
             }
             line.clear();
         }
         if line.trim() != "WARC/1.0" {
-            println!("Return false");
             return false;
         }
         line.clear();
@@ -56,12 +75,10 @@ impl<R: Read> WARCReader<R> {
             }
             line.clear();
         }
-        println!("{:?}", self.header);
         let content_len_str = self.header.get("Content-Length").expect("Content length not found");
         let content_len: usize = content_len_str.parse().expect("Failed to parse content len");
         self.buffer.resize(content_len, 0u8);
         self.reader.read_exact(&mut self.buffer[..]).expect("Failed to read content");
-        println!("read buffer {}", self.buffer.len());
         return true;
     }
 }
