@@ -12,40 +12,28 @@ extern crate chan;
 extern crate itertools;
 extern crate flate2;
 extern crate rayon;
+extern crate futures;
 
+use futures::future::Future;
 use flate2::read::MultiGzDecoder;
 mod warc_reader;
 use self::warc_reader::WARCReader;
 
+use std::time::Duration;
 use curl::easy;
 use std::thread;
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::str;
 use structopt::StructOpt;
 use std::fs::{self, File};
-use tantivy::IndexWriter;
+use tantivy::{Index, IndexWriter};
 use tantivy::schema::{Schema, SchemaBuilder, TEXT, STORED};
 use std::io::{BufRead, BufReader};
 use itertools::Itertools;
 
 const WET_FILE: &'static str = "wet.txt";
-
-
-enum Status {
-    COMPLETED,
-    CHECKPOINT(String),
-}
-
-
-impl From<String> for Status {
-    fn from(payload: String) -> Self {
-        if payload == "COMPLETED" {
-            Status::COMPLETED
-        } else {
-            Status::CHECKPOINT(payload)
-        }
-    }
-}
+const WAIT_AFTER_RETRY_SECONDS: u64 = 30u64;
 
 #[derive(StructOpt, Debug)]
 enum CliOption {
@@ -116,7 +104,7 @@ fn init(index_directory: &Path, wet_files: &Path) {
         panic!("Index directory already exists");
     }
     fs::create_dir(index_directory).expect("Failed to create index directory");
-    tantivy::Index::create(index_directory, schema()).expect("Failed to create the index");
+    Index::create(index_directory, schema()).expect("Failed to create the index");
     let dest_wet_file = index_directory.join(WET_FILE);
     fs::copy(wet_files, &dest_wet_file).expect("Failed to copy url file");
 }
@@ -136,15 +124,43 @@ impl WetData {
 
 
 #[derive(Default)]
-struct Collector(pub Vec<u8>);
+struct DownloadToBuffer(pub Vec<u8>);
 
-impl easy::Handler for Collector {
+impl easy::Handler for DownloadToBuffer {
     fn write(&mut self, data: &[u8]) -> Result<usize, easy::WriteError> {
         self.0.extend_from_slice(data);
         Ok(data.len())
     }
 }
 
+impl DownloadToBuffer {
+    fn purge(&mut self) -> Vec<u8> {
+        mem::replace(&mut self.0, Vec::new())
+    }
+}
+
+fn download(url: &str) -> Result<Vec<u8>, curl::Error> {
+    let collector = DownloadToBuffer::default();
+    let mut easy = easy::Easy2::new(collector);
+    easy.get(true)?;
+    easy.url(&url)?;
+    easy.perform()?;
+    assert_eq!(easy.response_code()?, 200);
+    Ok(easy.get_mut().purge())
+}
+
+fn download_with_retry(url: &str, num_retries: usize) -> Result<Vec<u8>, curl::Error> {
+    assert!(num_retries > 0);
+    for _ in 0..(num_retries - 1)  {
+        if let Ok(buffer) = download(url) {
+            return Ok(buffer);
+        } else {
+            warn!("Failed, retrying!");
+            thread::sleep(Duration::from_secs(WAIT_AFTER_RETRY_SECONDS))
+        }
+    }
+    download(url)
+}
 
 fn download_wet(url_root: String, wet_files: WetFiles) -> chan::Receiver<WetData> {
     let (send, recv) = chan::sync(1);
@@ -153,20 +169,11 @@ fn download_wet(url_root: String, wet_files: WetFiles) -> chan::Receiver<WetData
         for (i, wet_file) in wet_files.files().iter().enumerate() {
             let url = format!("{}{}", url_root, wet_file);
             info!("DL {} / {}): {}", i, num_files, url);
-            let mut collector = Collector::default();
-            let wet_data: Vec<u8> = {
-                let mut easy = easy::Easy2::new(collector);
-                easy.get(true).unwrap();
-                easy.url(&url).unwrap();
-                easy.perform().expect("Download fail");
-                assert_eq!(easy.response_code().unwrap(), 200);
-                easy.get_ref().0.clone()
-            };
-            let wet_data = WetData {
+            let wet_data: Vec<u8> = download_with_retry(&url, 10).expect("Download fail");
+            send.send(WetData {
                 wet_file: wet_file.clone(),
                 data: wet_data,
-            };
-            send.send(wet_data)
+            })
         }
     });
     recv
@@ -225,43 +232,53 @@ fn index_wet_file(wet_data: &WetData, schema: &Schema, index_writer: &mut IndexW
     info!("FINISHED INDEXING {}. {} docs", wet_data.wet_file, count);
 }
 
-fn resume_download(index_directory: &Path, url_root: &str) {
+fn resume_indexing(index_directory: &Path, url_root: &str) -> tantivy::Result<()> {
     let wet_files_file = index_directory.join(WET_FILE);
     let mut wet_files = WetFiles::load(&wet_files_file).expect("Failed to load url list file");
-    let index = tantivy::Index::open(index_directory).expect("Failed to open the index");
+    let index = Index::open(index_directory)?;
     let schema = index.schema();
-    let index_metas = index.load_metas().expect("metas");
+    let index_metas = index.load_metas()?;
     if let Some(checkpoint) = index_metas.payload {
-        let status = Status::from(checkpoint);
-        match status {
-            Status::COMPLETED => {
-                info!("The current shard has already finished.");
-                return;
-            }
-            Status::CHECKPOINT(checkpoint) => {
-                info!("Resuming at {:?}", checkpoint);
-                wet_files.skip_to(&checkpoint);
-            }
-        }
+        info!("Resuming at {:?}", checkpoint);
+        wet_files.skip_to(&checkpoint);
     }
-    let mut index_writer = index.writer_with_num_threads(2, 2_000_000_000).expect("Failed to create index writer");
-    let wet_queue = download_wet(url_root.to_string(), wet_files);
+    {
+        let mut index_writer = index.writer_with_num_threads(2, 2_000_000_000)?;
+        let wet_queue = download_wet(url_root.to_string(), wet_files);
 
-    for wet_files in wet_queue.into_iter().chunks(CHUNK_SIZE).into_iter() {
-        let mut checkpoint = String::new();
-        for wet_data in wet_files {
-            index_wet_file(&wet_data, &schema, &mut index_writer);
-            checkpoint = wet_data.wet_file.clone();
+        for wet_files in wet_queue.into_iter().chunks(CHUNK_SIZE).into_iter() {
+            let mut checkpoint = String::new();
+            for wet_data in wet_files {
+                index_wet_file(&wet_data, &schema, &mut index_writer);
+                checkpoint = wet_data.wet_file.clone();
+            }
+            info!("PREPARE COMMIT: {}", checkpoint);
+            let mut prepared_commit = index_writer.prepare_commit()?;
+            prepared_commit.set_payload(&checkpoint);
+            prepared_commit.commit()?;
+            info!("COMMITTED: {}", checkpoint);
         }
-        info!("PREPARE COMMIT: {}", checkpoint);
-        let mut prepared_commit = index_writer.prepare_commit().expect("Failed to prepare commit");
-        prepared_commit.set_payload(&checkpoint);
-        prepared_commit.commit().expect("Commit failed");
-        info!("COMMITTED: {}", checkpoint);
+
+        info!("Wait merging threads");
+        index_writer.wait_merging_threads()?;
     }
 
-    info!("Wait merging threads");
-    index_writer.wait_merging_threads().expect("Failed to wait for the merging threads");
+    info!("Optimizing");
+    let segments = index.searchable_segment_ids()?;
+    if segments.len() > 1 {
+        index
+            .writer_with_num_threads(1, 10_000_000)?
+            .merge(&segments)
+            .wait()
+            .expect("Merge failed");
+    } else {
+        info!("Merge not required");
+    }
+    info!("Garbage collect irrelevant segments.");
+    index
+        .writer_with_num_threads(1, 10_000_000)?
+        .garbage_collect_files()?;
+    Ok(())
 }
 
 fn main() {
@@ -275,7 +292,7 @@ fn main() {
         }
         CliOption::Run { index_directory, url_root } => {
             let index_directory = PathBuf::from(index_directory);
-            resume_download(&index_directory, &url_root);
+            resume_indexing(&index_directory, &url_root).expect("Indexing failed");
         }
     }
 }
