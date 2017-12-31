@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::str;
 use structopt::StructOpt;
 use std::fs::{self, File};
-use tantivy::{Index, IndexWriter};
+use tantivy::{Index, IndexWriter, SegmentMeta, SegmentId};
 use tantivy::schema::{Schema, SchemaBuilder, TEXT, STORED};
 use std::io::{BufRead, BufReader};
 use itertools::Itertools;
@@ -264,20 +264,29 @@ fn resume_indexing(index_directory: &Path, url_root: &str) -> tantivy::Result<()
     }
 
     info!("Optimizing");
-    let segments = index.searchable_segment_ids()?;
-    if segments.len() > 1 {
-        index
-            .writer_with_num_threads(1, 10_000_000)?
-            .merge(&segments)
+    loop {
+        let mut segment_metas: Vec<SegmentMeta> = index.searchable_segment_metas()?;
+        segment_metas.sort_by_key(|segment_meta| segment_meta.max_doc());
+        let num_segments_to_merge = usize::min(8, segment_metas.len());
+        if num_segments_to_merge <= 1 {
+            break;
+        }
+        info!("Merging {} segments", num_segments_to_merge);
+        let segment_ids: Vec<SegmentId> = segment_metas[..num_segments_to_merge]
+            .iter()
+            .map(|meta| meta.id())
+            .collect();
+        let mut index_writer = index
+            .writer_with_num_threads(1, 10_000_000)?;
+
+        index_writer
+            .merge(&segment_ids)
             .wait()
             .expect("Merge failed");
-    } else {
-        info!("Merge not required");
+
+        info!("Garbage collect irrelevant segments.");
+        index_writer.garbage_collect_files()?;
     }
-    info!("Garbage collect irrelevant segments.");
-    index
-        .writer_with_num_threads(1, 10_000_000)?
-        .garbage_collect_files()?;
     Ok(())
 }
 
