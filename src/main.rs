@@ -18,7 +18,8 @@ use futures::future::Future;
 use flate2::read::MultiGzDecoder;
 mod warc_reader;
 use self::warc_reader::WARCReader;
-
+use tantivy::tokenizer::{AlphaNumOnlyFilter, SimpleTokenizer, RemoveLongFilter, LowerCaser, Stemmer};
+use tantivy::tokenizer::Tokenizer;
 use std::time::Duration;
 use curl::easy;
 use std::thread;
@@ -28,7 +29,7 @@ use std::str;
 use structopt::StructOpt;
 use std::fs::{self, File};
 use tantivy::{Index, IndexWriter, SegmentMeta, SegmentId};
-use tantivy::schema::{Schema, SchemaBuilder, TEXT, STORED};
+use tantivy::schema::{Schema, SchemaBuilder, TextOptions, TextFieldIndexing, IndexRecordOption, STORED};
 use std::io::{BufRead, BufReader};
 use itertools::Itertools;
 
@@ -94,7 +95,13 @@ impl WetFiles {
 
 fn schema() -> Schema {
     let mut schema_builder = SchemaBuilder::new();
-    schema_builder.add_text_field("text", TEXT | STORED);
+    let text_indexing_options = TextFieldIndexing::default()
+        .set_index_option(IndexRecordOption::WithFreqsAndPositions)
+        .set_tokenizer("commoncrawl");
+    let text_options = TextOptions::default()
+        .set_indexing_options(text_indexing_options)
+        .set_stored();
+    schema_builder.add_text_field("text", text_options);
     schema_builder.add_text_field("url", STORED);
     schema_builder.build()
 }
@@ -236,6 +243,12 @@ fn resume_indexing(index_directory: &Path, url_root: &str) -> tantivy::Result<()
     let wet_files_file = index_directory.join(WET_FILE);
     let mut wet_files = WetFiles::load(&wet_files_file).expect("Failed to load url list file");
     let index = Index::open(index_directory)?;
+    index.tokenizers().register("commoncrawl", SimpleTokenizer
+        .filter(RemoveLongFilter::limit(40))
+        .filter(LowerCaser)
+        .filter(AlphaNumOnlyFilter)
+        .filter(Stemmer::new())
+    );
     let schema = index.schema();
     let index_metas = index.load_metas()?;
     if let Some(checkpoint) = index_metas.payload {
@@ -267,7 +280,7 @@ fn resume_indexing(index_directory: &Path, url_root: &str) -> tantivy::Result<()
     loop {
         let mut segment_metas: Vec<SegmentMeta> = index.searchable_segment_metas()?;
         segment_metas.sort_by_key(|segment_meta| segment_meta.max_doc());
-        let num_segments_to_merge = usize::min(8, segment_metas.len());
+        let num_segments_to_merge = usize::min(9, segment_metas.len());
         if num_segments_to_merge <= 1 {
             break;
         }
