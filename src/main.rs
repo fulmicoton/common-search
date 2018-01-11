@@ -256,7 +256,7 @@ fn resume_indexing(index_directory: &Path, url_root: &str) -> tantivy::Result<()
         wet_files.skip_to(&checkpoint);
     }
     {
-        let mut index_writer = index.writer_with_num_threads(2, 2_000_000_000)?;
+        let mut index_writer = index.writer_with_num_threads(2, 1_400_000_000)?;
         let wet_queue = download_wet(url_root.to_string(), wet_files);
 
         for wet_files in wet_queue.into_iter().chunks(CHUNK_SIZE).into_iter() {
@@ -280,7 +280,17 @@ fn resume_indexing(index_directory: &Path, url_root: &str) -> tantivy::Result<()
     loop {
         let mut segment_metas: Vec<SegmentMeta> = index.searchable_segment_metas()?;
         segment_metas.sort_by_key(|segment_meta| segment_meta.max_doc());
-        let num_segments_to_merge = usize::min(9, segment_metas.len());
+
+        let num_segments_to_merge = {
+            if segment_metas.len() <= 10 {
+                segment_metas.len()
+            } else if segment_metas.len() <= 16 {
+                segment_metas.len() / 2
+            } else {
+                8
+            }
+        };
+
         if num_segments_to_merge <= 1 {
             break;
         }
@@ -289,16 +299,19 @@ fn resume_indexing(index_directory: &Path, url_root: &str) -> tantivy::Result<()
             .iter()
             .map(|meta| meta.id())
             .collect();
+
         let mut index_writer = index
             .writer_with_num_threads(1, 10_000_000)?;
+
+        info!("Garbage collect irrelevant segments.");
+        index_writer.garbage_collect_files()?;
 
         index_writer
             .merge(&segment_ids)
             .wait()
             .expect("Merge failed");
 
-        info!("Garbage collect irrelevant segments.");
-        index_writer.garbage_collect_files()?;
+
     }
     Ok(())
 }
